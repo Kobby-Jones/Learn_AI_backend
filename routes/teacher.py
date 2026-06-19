@@ -1,8 +1,9 @@
 """routes/teacher.py"""
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from models import User, AssessmentResult, Enrollment, MaterialProgress, LearningMaterial, Bookmark
+from models import User, AssessmentResult, Enrollment, MaterialProgress, LearningMaterial, Bookmark, TeacherClass, log_event
 from extensions import db
+from utils.grades import GRADES, grade_label, grade_order, clean_grade_list
 import json
 from sqlalchemy import func
 
@@ -16,21 +17,81 @@ def _require_teacher(user_id):
     return user
 
 
+def _teacher_grades(user):
+    """
+    The grades a user is allowed to see.
+    - Admins see every grade.
+    - Teachers see only the classes assigned to them.
+    """
+    if user.role == "admin":
+        return [g["value"] for g in GRADES]
+    return user.class_grades
+
+
+def _scoped_students(user):
+    """Active students that fall within `user`'s assigned classes."""
+    grades = _teacher_grades(user)
+    if user.role == "admin":
+        # Admin: all students (including any without a grade set).
+        return User.query.filter_by(role="student", is_active=True).all()
+    if not grades:
+        return []   # teacher with no class assigned sees nobody yet
+    return User.query.filter(
+        User.role == "student",
+        User.is_active == True,
+        User.grade.in_(grades),
+    ).all()
+
+
+def _client_ip():
+    return request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+
+
+@teacher_bp.get("/classes")
+@jwt_required()
+def get_classes():
+    """The classes this teacher is assigned to, plus the full list to choose from."""
+    user = _require_teacher(get_jwt_identity())
+    if not user:
+        return jsonify({"error": "Forbidden"}), 403
+    assigned = _teacher_grades(user)
+    return jsonify({
+        "classes":    [{"value": g, "label": grade_label(g)} for g in assigned],
+        "allGrades":  GRADES,
+        "isAdmin":    user.role == "admin",
+    }), 200
+
+
+@teacher_bp.put("/classes")
+@jwt_required()
+def set_classes():
+    """Replace the set of classes a teacher is assigned to."""
+    user = _require_teacher(get_jwt_identity())
+    if not user:
+        return jsonify({"error": "Forbidden"}), 403
+    if user.role != "teacher":
+        return jsonify({"error": "Admins automatically see every class"}), 400
+
+    data = request.get_json() or {}
+    grades = clean_grade_list(data.get("classes") or [])
+
+    TeacherClass.query.filter_by(teacher_id=user.id).delete()
+    for g in grades:
+        db.session.add(TeacherClass(teacher_id=user.id, grade=g))
+    log_event(user, "Teacher classes updated", level="info", ip=_client_ip(),
+              detail="Classes: " + (", ".join(grade_label(g) for g in grades) or "none"))
+    db.session.commit()
+    return jsonify({"classes": [{"value": g, "label": grade_label(g)} for g in grades]}), 200
+
+
 @teacher_bp.get("/students")
 @jwt_required()
 def get_students():
-    uid = get_jwt_identity()
-    if not _require_teacher(uid):
+    user = _require_teacher(get_jwt_identity())
+    if not user:
         return jsonify({"error": "Forbidden"}), 403
 
-    enrollments = Enrollment.query.filter_by(teacher_id=uid).all()
-    student_ids = [e.student_id for e in enrollments]
-
-    # If no enrollments yet, surface all students (useful for demo)
-    if not student_ids:
-        students = User.query.filter_by(role="student", is_active=True).all()
-    else:
-        students = User.query.filter(User.id.in_(student_ids), User.is_active == True).all()
+    students = _scoped_students(user)
 
     result = []
     for s in students:
@@ -49,6 +110,8 @@ def get_students():
             "name":             s.name,
             "email":            s.email,
             "avatar":           s.avatar,
+            "grade":            s.grade,
+            "gradeLabel":       grade_label(s.grade) if s.grade else None,
             "lastActivity":     latest.completed_at.isoformat() if latest else s.created_at.isoformat(),
             "totalAssessments": len(scores),
             "averageScore":     avg,
@@ -56,6 +119,8 @@ def get_students():
             "riskLevel":        latest.risk_level if latest else None,
             "trend":            trend,
         })
+    # Order students by grade then name so class groupings read naturally.
+    result.sort(key=lambda r: (grade_order(r["grade"]), r["name"].lower()))
     return jsonify(result), 200
 
 
@@ -63,12 +128,17 @@ def get_students():
 @jwt_required()
 def get_student_detail(student_id):
     uid = get_jwt_identity()
-    if not _require_teacher(uid):
+    user = _require_teacher(uid)
+    if not user:
         return jsonify({"error": "Forbidden"}), 403
 
     student = User.query.get(student_id)
     if not student or student.role != "student":
         return jsonify({"error": "Student not found"}), 404
+
+    # A teacher may only open students from their own classes.
+    if user.role == "teacher" and student.grade not in _teacher_grades(user):
+        return jsonify({"error": "This student is not in one of your classes"}), 403
 
     results = AssessmentResult.query.filter_by(student_id=student_id)\
                 .order_by(AssessmentResult.completed_at.asc()).all()
@@ -98,10 +168,11 @@ def get_student_detail(student_id):
 @jwt_required()
 def classroom_stats():
     uid = get_jwt_identity()
-    if not _require_teacher(uid):
+    user = _require_teacher(uid)
+    if not user:
         return jsonify({"error": "Forbidden"}), 403
 
-    students     = User.query.filter_by(role="student", is_active=True).all()
+    students     = _scoped_students(user)
     total        = len(students)
     assessed_ids = set()
     all_scores   = []
@@ -143,10 +214,15 @@ def classroom_stats():
 @jwt_required()
 def teacher_analytics():
     uid = get_jwt_identity()
-    if not _require_teacher(uid):
+    user = _require_teacher(uid)
+    if not user:
         return jsonify({"error": "Forbidden"}), 403
 
-    all_results = AssessmentResult.query.all()
+    student_ids = [s.id for s in _scoped_students(user)]
+    all_results = (
+        AssessmentResult.query.filter(AssessmentResult.student_id.in_(student_ids)).all()
+        if student_ids else []
+    )
     domain_totals = {"mathematics": [], "grammar": [], "reading": [], "memory": [], "reasoning": []}
     for r in all_results:
         for ds in r.domain_scores:
@@ -179,10 +255,11 @@ def teacher_analytics():
 @jwt_required()
 def recommendations_engagement():
     uid = get_jwt_identity()
-    if not _require_teacher(uid):
+    user = _require_teacher(uid)
+    if not user:
         return jsonify({"error": "Forbidden"}), 403
 
-    students = User.query.filter_by(role="student", is_active=True).all()
+    students = _scoped_students(user)
     rows = []
     total_assigned = 0
     total_completed = 0
@@ -223,10 +300,12 @@ def recommendations_engagement():
 def list_reports():
     """Synthesise a list of reports from real assessment data."""
     uid = get_jwt_identity()
-    if not _require_teacher(uid):
+    user = _require_teacher(uid)
+    if not user:
         return jsonify({"error": "Forbidden"}), 403
 
-    students = User.query.filter_by(role="student", is_active=True).all()
+    students = _scoped_students(user)
+    student_ids = [s.id for s in students]
     reports = []
 
     # Weekly summary (always present)
@@ -237,9 +316,11 @@ def list_reports():
         "type":  "summary",
     })
 
-    # Per-student latest result (most recent five)
+    # Per-student latest result (most recent five within this teacher's classes)
     latest_results = (
-        AssessmentResult.query.order_by(AssessmentResult.completed_at.desc()).limit(5).all()
+        AssessmentResult.query.filter(AssessmentResult.student_id.in_(student_ids))
+        .order_by(AssessmentResult.completed_at.desc()).limit(5).all()
+        if student_ids else []
     )
     for r in latest_results:
         student = User.query.get(r.student_id)

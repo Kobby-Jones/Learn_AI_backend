@@ -4,7 +4,8 @@ import bcrypt
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from extensions import db
-from models import User, log_event
+from models import User, TeacherClass, log_event
+from utils.grades import is_valid_grade, clean_grade_list
 from config import Config
 from datetime import datetime, timezone
 
@@ -23,12 +24,18 @@ def register():
     password = data.get("password", "")
     role     = data.get("role", "student")
     teacher_code = data.get("teacherCode", "")
+    grade    = (data.get("grade") or "").strip()           # for students
+    classes  = clean_grade_list(data.get("classes") or [])  # for teachers
 
     if not name or not email or not password:
         return jsonify({"error": "Name, email and password are required"}), 400
 
     if role not in ("student", "teacher", "admin"):
         return jsonify({"error": "Invalid role"}), 400
+
+    # A student must pick the grade/class they belong to.
+    if role == "student" and not is_valid_grade(grade):
+        return jsonify({"error": "Please select your grade/class"}), 400
 
     if role == "teacher" and teacher_code != Config.TEACHER_REGISTRATION_CODE:
         return jsonify({"error": "Invalid teacher registration code"}), 403
@@ -47,8 +54,15 @@ def register():
         email=email,
         password_hash=hashed,
         role=role,
+        grade=grade if role == "student" else None,
     )
     db.session.add(user)
+
+    # Assign the teacher to the classes they selected (if any).
+    if role == "teacher":
+        for g in classes:
+            db.session.add(TeacherClass(teacher_id=user.id, grade=g))
+
     log_event(user, "User registered", level="success", ip=_client_ip(), detail=f"Role: {role}")
     db.session.commit()
 

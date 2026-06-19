@@ -25,6 +25,7 @@ def create_app():
     from routes.admin      import admin_bp
     from routes.teacher    import teacher_bp
     from routes.notifications import notifications_bp
+    from routes.meta       import meta_bp
 
     app.register_blueprint(auth_bp,            url_prefix="/api/auth")
     app.register_blueprint(assessment_bp,      url_prefix="/api/assessment")
@@ -34,15 +35,19 @@ def create_app():
     app.register_blueprint(admin_bp,           url_prefix="/api/admin")
     app.register_blueprint(teacher_bp,         url_prefix="/api/teacher")
     app.register_blueprint(notifications_bp,   url_prefix="/api/notifications")
+    app.register_blueprint(meta_bp,            url_prefix="/api/meta")
 
     # Create tables
     with app.app_context():
         db.create_all()
+        from utils.migrate import ensure_schema, backfill_grades
+        ensure_schema()        # add any new columns to a pre-existing DB
         from utils.seed import seed_if_empty
         seed_if_empty()
+        backfill_grades()      # upgrade older databases to grade-aware data
 
     return app
 
 if __name__ == "__main__":
     app = create_app()
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=8080)

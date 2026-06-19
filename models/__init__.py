@@ -4,6 +4,7 @@ models/__init__.py  — All SQLAlchemy models, matching frontend TypeScript type
 from extensions import db
 from datetime import datetime, timezone
 import json
+from utils.grades import grade_label, grade_order
 
 def utcnow():
     return datetime.now(timezone.utc)
@@ -18,6 +19,9 @@ class User(db.Model):
     password_hash= db.Column(db.String(255), nullable=False)
     role         = db.Column(db.String(20), nullable=False, default="student")  # student|teacher|admin
     avatar       = db.Column(db.String(255))
+    # Grade/class a STUDENT belongs to (one of utils.grades.GRADE_VALUES).
+    # Null for teachers/admins — teachers use the teacher_classes relationship instead.
+    grade        = db.Column(db.String(20))
     created_at   = db.Column(db.DateTime, default=utcnow)
     last_login   = db.Column(db.DateTime)
     is_active    = db.Column(db.Boolean, default=True)
@@ -34,6 +38,16 @@ class User(db.Model):
     # Teacher → students (many-to-many via enrollment)
     enrolled_students = db.relationship("Enrollment", foreign_keys="Enrollment.teacher_id", back_populates="teacher", lazy="dynamic")
     enrolled_teachers = db.relationship("Enrollment", foreign_keys="Enrollment.student_id", back_populates="student", lazy="dynamic")
+    # Classes (grades) a TEACHER is assigned to teach
+    teacher_classes   = db.relationship("TeacherClass", back_populates="teacher",
+                                        cascade="all, delete-orphan", lazy="dynamic")
+
+    @property
+    def class_grades(self):
+        """List of grade codes this teacher is assigned to, in canonical order."""
+        grades = [tc.grade for tc in self.teacher_classes]
+        grades.sort(key=grade_order)
+        return grades
 
     @property
     def preferences(self):
@@ -44,12 +58,17 @@ class User(db.Model):
         self._preferences = json.dumps(value)
 
     def to_dict(self):
+        classes = self.class_grades if self.role == "teacher" else []
         return {
             "id":           self.id,
             "name":         self.name,
             "email":        self.email,
             "role":         self.role,
             "avatar":       self.avatar,
+            "grade":        self.grade,
+            "gradeLabel":   grade_label(self.grade) if self.grade else None,
+            "classes":      classes,
+            "classLabels":  [grade_label(g) for g in classes],
             "createdAt":    self.created_at.isoformat() if self.created_at else None,
             "lastLogin":    self.last_login.isoformat()  if self.last_login  else None,
             "isActive":     self.is_active,
@@ -68,12 +87,25 @@ class Enrollment(db.Model):
     student    = db.relationship("User", foreign_keys=[student_id], back_populates="enrolled_teachers")
 
 
+# ── TeacherClass (a class/grade a teacher is assigned to teach) ────────────────
+class TeacherClass(db.Model):
+    __tablename__ = "teacher_classes"
+    id         = db.Column(db.Integer, primary_key=True)
+    teacher_id = db.Column(db.String(36), db.ForeignKey("users.id"), nullable=False)
+    grade      = db.Column(db.String(20), nullable=False)   # one of utils.grades.GRADE_VALUES
+    assigned_at= db.Column(db.DateTime, default=utcnow)
+    teacher    = db.relationship("User", back_populates="teacher_classes")
+
+    __table_args__ = (db.UniqueConstraint("teacher_id", "grade", name="uq_teacher_grade"),)
+
+
 # ── Question ──────────────────────────────────────────────────────────────────
 class Question(db.Model):
     __tablename__ = "questions"
 
     id           = db.Column(db.String(36), primary_key=True)
     domain       = db.Column(db.String(30), nullable=False)  # mathematics|grammar|reading|memory|reasoning
+    grade        = db.Column(db.String(20))                  # which grade/class this question belongs to
     type         = db.Column(db.String(40), nullable=False)
     text         = db.Column(db.Text, nullable=False)
     passage      = db.Column(db.Text)
@@ -96,6 +128,8 @@ class Question(db.Model):
         return {
             "id":            self.id,
             "domain":        self.domain,
+            "grade":         self.grade,
+            "gradeLabel":    grade_label(self.grade) if self.grade else None,
             "type":          self.type,
             "text":          self.text,
             "passage":       self.passage,
@@ -113,6 +147,7 @@ class Assessment(db.Model):
 
     id           = db.Column(db.String(36), primary_key=True)
     student_id   = db.Column(db.String(36), db.ForeignKey("users.id"), nullable=False)
+    grade        = db.Column(db.String(20))  # snapshot of the grade this assessment was taken at
     status       = db.Column(db.String(20), default="pending")  # pending|in_progress|completed|analysing
     started_at   = db.Column(db.DateTime, default=utcnow)
     completed_at = db.Column(db.DateTime)
@@ -125,6 +160,8 @@ class Assessment(db.Model):
         return {
             "id":          self.id,
             "studentId":   self.student_id,
+            "grade":       self.grade,
+            "gradeLabel":  grade_label(self.grade) if self.grade else None,
             "status":      self.status,
             "startedAt":   self.started_at.isoformat()   if self.started_at   else None,
             "completedAt": self.completed_at.isoformat() if self.completed_at else None,

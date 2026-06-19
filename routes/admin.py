@@ -3,8 +3,9 @@ import time
 import platform
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from models import User, Assessment, AssessmentResult, LearningMaterial, AuditLog
+from models import User, Assessment, AssessmentResult, LearningMaterial, AuditLog, TeacherClass
 from extensions import db
+from utils.grades import is_valid_grade, clean_grade_list
 from datetime import datetime, timezone, timedelta
 
 admin_bp = Blueprint("admin", __name__)
@@ -93,6 +94,21 @@ def update_user(user_id):
         user.role = data["role"]
     if "name" in data:
         user.name = data["name"].strip()
+    # Set a student's grade/class
+    if "grade" in data:
+        g = data["grade"]
+        if g in (None, ""):
+            user.grade = None
+        elif is_valid_grade(g):
+            user.grade = g
+        else:
+            return jsonify({"error": "Invalid grade"}), 400
+    # Set a teacher's assigned classes
+    if "classes" in data:
+        grades = clean_grade_list(data.get("classes") or [])
+        TeacherClass.query.filter_by(teacher_id=user.id).delete()
+        for g in grades:
+            db.session.add(TeacherClass(teacher_id=user.id, grade=g))
     db.session.commit()
     return jsonify(user.to_dict()), 200
 

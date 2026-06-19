@@ -12,12 +12,32 @@ from utils.recommendations import generate_recommendations
 assessment_bp = Blueprint("assessment", __name__)
 
 
-# ── Get all questions (served to the frontend to run the assessment) ──────────
+# ── Get questions for the assessment (filtered to the student's grade) ─────────
 @assessment_bp.get("/questions")
 @jwt_required()
 def get_questions():
-    """Returns the full question bank sorted by domain."""
-    questions = Question.query.filter_by(is_active=True).all()
+    """
+    Returns the question bank for ONE grade only, sorted by domain.
+
+    A student always gets the questions for their own grade (set at signup) —
+    this is what enforces "request the grade before giving questions". Teachers
+    and admins may preview any grade by passing ?grade=<code>.
+    """
+    user = User.query.get(get_jwt_identity())
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    if user.role == "student":
+        grade = user.grade
+        if not grade:
+            return jsonify({"error": "No grade set on your account. Please contact your teacher."}), 409
+    else:
+        # Teacher/admin preview — must specify which grade to look at.
+        grade = request.args.get("grade")
+        if not grade:
+            return jsonify({"error": "Specify a grade to preview, e.g. ?grade=basic5"}), 400
+
+    questions = Question.query.filter_by(is_active=True, grade=grade).all()
     ordered_domains = ["mathematics", "grammar", "reading", "memory", "reasoning"]
     questions.sort(key=lambda q: ordered_domains.index(q.domain) if q.domain in ordered_domains else 99)
     return jsonify([q.to_dict() for q in questions]), 200
@@ -32,6 +52,10 @@ def start_assessment():
     if not user or user.role != "student":
         return jsonify({"error": "Only students can start assessments"}), 403
 
+    # A student must have a grade before any questions can be served.
+    if not user.grade:
+        return jsonify({"error": "No grade set on your account. Please contact your teacher."}), 409
+
     # Mark any in-progress assessment as abandoned
     Assessment.query.filter_by(student_id=user_id, status="in_progress").update({"status": "abandoned"})
     db.session.commit()
@@ -39,6 +63,7 @@ def start_assessment():
     assessment = Assessment(
         id=str(uuid.uuid4()),
         student_id=user_id,
+        grade=user.grade,
         status="in_progress",
         started_at=datetime.now(timezone.utc),
     )
