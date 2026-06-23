@@ -12,6 +12,8 @@ class Config:
     JWT_SECRET_KEY           = os.getenv("JWT_SECRET_KEY", "jwt-secret-change-in-production")
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=24)
     SQLALCHEMY_DATABASE_URI  = os.getenv("DATABASE_URL", "sqlite:///learnai.db")
+
+
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     TEACHER_REGISTRATION_CODE = os.getenv("TEACHER_CODE", "TEACHER2024")
     # Open admin self-registration is on in dev so the demo Register page works.

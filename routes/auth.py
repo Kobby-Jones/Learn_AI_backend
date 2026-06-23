@@ -63,6 +63,8 @@ def register():
         for g in classes:
             db.session.add(TeacherClass(teacher_id=user.id, grade=g))
 
+    # Flush so the user row exists in the DB before the audit log FK reference
+    db.session.flush()
     log_event(user, "User registered", level="success", ip=_client_ip(), detail=f"Role: {role}")
     db.session.commit()
 
