@@ -2,8 +2,7 @@
 app.py — Main Flask application entry point
 """
 import os
-
-from flask import Flask
+from flask import Flask, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager
 from extensions import db
@@ -13,14 +12,15 @@ def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
 
-
-
-
-
     # Extensions
     CORS(app, resources={r"/api/*": {"origins": "*"}})
     db.init_app(app)
     JWTManager(app)
+
+    # Health check endpoint (keeps Render from going dormant)
+    @app.route("/health")
+    def health():
+        return jsonify({"status": "ok"}), 200
 
     # Register blueprints
     from routes.auth       import auth_bp
@@ -47,10 +47,10 @@ def create_app():
     with app.app_context():
         db.create_all()
         from utils.migrate import ensure_schema, backfill_grades
-        ensure_schema()        # add any new columns to a pre-existing DB
+        ensure_schema()
         from utils.seed import seed_if_empty
         seed_if_empty()
-        backfill_grades()      # upgrade older databases to grade-aware data
+        backfill_grades()
 
     return app
 
